@@ -1,0 +1,305 @@
+// ===== Arduino UNO Battery Voltage + Current + RPM Measurement =====
+// Voltage divider output -> A0
+// ACS712 output         -> A2
+// IR sensor OUT         -> D10
+// IMPORTANT: A0 and A2 must NEVER exceed 5V
+
+// ===================== PIN DEFINITIONS =====================
+const int ADC_PIN     = A0;
+const int CURRENT_PIN = A2;
+const int IR_PIN      = 10;
+
+// ===================== ADC + VOLTAGE SETTINGS =====================
+const float VREF      = 5.0;
+const float ADC_MAX   = 1023.0;
+const float DIV_RATIO = 109.89 / 9.89;   // (R1 + R2) / R2
+const int   N_SAMPLES = 50;
+
+// ===================== CURRENT SENSOR SETTINGS =====================
+const float CURRENT_ZERO = 2.5;    // ACS712 zero-current voltage
+const float SENSITIVITY  = 0.066;  // V/A for ACS712 30A version
+
+// ===================== RPM SETTINGS =====================
+// CHANGE THIS to match the number of reflective strips on the rotating part
+const int STRIPS_PER_REV = 2;
+
+// Most of these reflective IR modules go LOW when they detect the reflective mark
+const bool SENSOR_ACTIVE_LOW = true;
+
+// Require the signal to stay in a new state for this long before accepting it
+// Helps reject chatter/noise at the threshold
+const unsigned long STABLE_STATE_US = 1500;
+
+// Reject impossible pulse-to-pulse intervals
+// 3000 us means max accepted pulse rate ~= 333 pulses/sec
+// With 1 strip/rev, that's ~20000 RPM max; with 2 strips/rev, ~10000 RPM max
+const unsigned long MIN_PULSE_INTERVAL_US = 3000;
+
+// If no pulse arrives for this many times the average pulse interval, report 0 RPM
+const float STOP_TIMEOUT_FACTOR = 2.5;
+
+// Average the most recent few pulse intervals for a steadier RPM
+const int PERIOD_BUFFER_SIZE = 4;
+
+// ===================== PRINT / RUN SETTINGS =====================
+const int           MAX_COUNT      = 50;
+const unsigned long PRINT_INTERVAL = 1000;   // ms
+
+// ===================== RPM STATE =====================
+int lastRawState = HIGH;
+int stableState  = HIGH;
+
+unsigned long lastRawChangeTime = 0;
+
+// Armed means: sensor has returned to inactive state and is ready to count the next strip
+bool pulseArmed = true;
+
+unsigned long lastAcceptedPulseTime = 0;
+
+// Circular buffer of accepted pulse intervals
+unsigned long periodBuffer[PERIOD_BUFFER_SIZE] = {0};
+int periodIndex = 0;
+int validPeriods = 0;
+
+unsigned long pulseCount = 0;   // debug / optional count
+
+// ===================== TIMING STATE =====================
+unsigned long lastPrintTime = 0;
+
+// ==========================================================
+// HELPER: convert raw sensor read to "active/inactive" logic
+// active = reflective strip detected
+// inactive = no strip detected
+// ==========================================================
+bool isSensorActive(int rawState) {
+  if (SENSOR_ACTIVE_LOW) {
+    return (rawState == LOW);
+  } else {
+    return (rawState == HIGH);
+  }
+}
+
+// ==========================================================
+// HELPER: add a new pulse interval into averaging buffer
+// ==========================================================
+void storePeriod(unsigned long intervalUs) {
+  periodBuffer[periodIndex] = intervalUs;
+  periodIndex = (periodIndex + 1) % PERIOD_BUFFER_SIZE;
+
+  if (validPeriods < PERIOD_BUFFER_SIZE) {
+    validPeriods++;
+  }
+}
+
+// ==========================================================
+// HELPER: average pulse interval from buffer
+// Returns 0 if no valid interval exists yet
+// ==========================================================
+float getAveragePeriodUs() {
+  if (validPeriods == 0) return 0.0;
+
+  unsigned long sum = 0;
+  for (int i = 0; i < validPeriods; i++) {
+    sum += periodBuffer[i];
+  }
+
+  return (float)sum / (float)validPeriods;
+}
+
+// ==========================================================
+// CLEAN PULSE DETECTOR
+//
+// This does four important things:
+// 1. Debounces the sensor state itself
+// 2. Counts only one pulse per full strip pass
+// 3. Requires the sensor to return to inactive before re-arming
+// 4. Stores pulse-to-pulse interval for RPM
+//
+// Full logic:
+// inactive (armed) -> active => count exactly one pulse
+// then wait until active -> inactive before allowing another pulse
+// ==========================================================
+void updateRPMCounter() {
+  unsigned long now = micros();
+  int rawState = digitalRead(IR_PIN);
+
+  // Track raw state changes for debounce timing
+  if (rawState != lastRawState) {
+    lastRawState = rawState;
+    lastRawChangeTime = now;
+  }
+
+  // Only accept a state change if it has remained stable long enough
+  if ((now - lastRawChangeTime) >= STABLE_STATE_US && rawState != stableState) {
+    stableState = rawState;
+
+    bool active = isSensorActive(stableState);
+
+    if (active) {
+      // Count only if we were armed, meaning the previous strip fully passed already
+      if (pulseArmed) {
+        unsigned long intervalUs = now - lastAcceptedPulseTime;
+
+        // First pulse initializes timing; later pulses create valid periods
+        if (lastAcceptedPulseTime == 0) {
+          lastAcceptedPulseTime = now;
+          pulseCount++;
+          pulseArmed = false;
+        } else if (intervalUs >= MIN_PULSE_INTERVAL_US) {
+          storePeriod(intervalUs);
+          lastAcceptedPulseTime = now;
+          pulseCount++;
+          pulseArmed = false;
+        }
+      }
+    } else {
+      // Sensor is stably inactive again, so next strip may be counted
+      pulseArmed = true;
+    }
+  }
+}
+
+// ==========================================================
+// VOLTAGE ADC
+// ==========================================================
+float readAveragedADC() {
+  long sum = 0;
+  for (int i = 0; i < N_SAMPLES; i++) {
+    sum += analogRead(ADC_PIN);
+    delay(2);
+  }
+  return (float)sum / N_SAMPLES;
+}
+
+// ==========================================================
+// CURRENT ADC
+// ==========================================================
+float readAveragedCurrentADC() {
+  long sum = 0;
+  for (int i = 0; i < N_SAMPLES; i++) {
+    sum += analogRead(CURRENT_PIN);
+    delay(2);
+  }
+  return (float)sum / N_SAMPLES;
+}
+
+// ==========================================================
+// RPM FROM AVERAGE PULSE INTERVAL
+//
+// avgPeriodUs = average time between strip detections
+// One revolution = STRIPS_PER_REV strip detections
+//
+// time_per_rev_us = avgPeriodUs * STRIPS_PER_REV
+// rpm = 60,000,000 / time_per_rev_us
+// ==========================================================
+float computeRPM() {
+  float avgPeriodUs = getAveragePeriodUs();
+  if (avgPeriodUs <= 0.0) return 0.0;
+  if (STRIPS_PER_REV <= 0) return 0.0;
+
+  float timePerRevUs = avgPeriodUs * (float)STRIPS_PER_REV;
+  return 60000000.0 / timePerRevUs;
+}
+
+// ==========================================================
+// STOP GUARD
+// If no pulse arrives for too long, return 0 RPM
+// ==========================================================
+float getSafeRPM() {
+  float avgPeriodUs = getAveragePeriodUs();
+  if (avgPeriodUs <= 0.0) return 0.0;
+  if (lastAcceptedPulseTime == 0) return 0.0;
+
+  unsigned long now = micros();
+  unsigned long timeSinceLast = now - lastAcceptedPulseTime;
+
+  if ((float)timeSinceLast > avgPeriodUs * STOP_TIMEOUT_FACTOR) {
+    return 0.0;
+  }
+
+  return computeRPM();
+}
+
+// ==========================================================
+// PRINT ALL READINGS
+// ==========================================================
+void printReadings() {
+  float rpm = getSafeRPM();
+
+  lastPrintTime = millis();
+
+  // --- Voltage ---
+  float raw   = readAveragedADC();
+  float v_pin = (raw / ADC_MAX) * VREF;
+  float v_bat = v_pin * DIV_RATIO;
+
+  // --- Current ---
+  float rawCurrent     = readAveragedCurrentADC();
+  float currentVoltage = (rawCurrent / ADC_MAX) * VREF;
+  float current        = (currentVoltage - CURRENT_ZERO) / SENSITIVITY;
+
+  // --- Output ---
+  Serial.print(v_bat, 5);   Serial.print(" V\t");
+  Serial.print(current, 5); Serial.print(" A\t");
+  Serial.print(rpm, 2);     Serial.println(" RPM");
+}
+
+// ==========================================================
+// SETUP
+// ==========================================================
+void setup() {
+  Serial.begin(9600);
+  pinMode(IR_PIN, INPUT);
+
+  float raw   = readAveragedADC();
+  float v_pin = (raw / ADC_MAX) * VREF;
+  Serial.println(v_pin, 5);
+
+  int startState = digitalRead(IR_PIN);
+  lastRawState = startState;
+  stableState  = startState;
+
+  lastRawChangeTime = micros();
+  lastPrintTime = millis();
+}
+
+// ==========================================================
+// RUN FOREVER
+// ==========================================================
+void runInfinite() {
+  updateRPMCounter();
+
+  unsigned long currentTime = millis();
+  if (currentTime - lastPrintTime >= PRINT_INTERVAL) {
+    printReadings();
+  }
+}
+
+// ==========================================================
+// RUN EXACTLY MAX_COUNT TIMES
+// ==========================================================
+void runLimited() {
+  int printedCount = 0;
+
+  while (printedCount < MAX_COUNT) {
+    updateRPMCounter();
+
+    unsigned long currentTime = millis();
+    if (currentTime - lastPrintTime >= PRINT_INTERVAL) {
+      printReadings();
+      printedCount++;
+    }
+  }
+
+  while (true) {
+    // halt forever
+  }
+}
+
+// ==========================================================
+// MAIN LOOP
+// ==========================================================
+void loop() {
+  runInfinite();
+  // runLimited();
+}
